@@ -23,7 +23,7 @@
 走的是同一份流程，默认关闭，要令牌（见「看板交易」）。另有 Lighter RH ↔ Arcus 同名合约
 价差的只读监控（见「Lighter RH ↔ Arcus 价差监控」）。
 
-
+要在克隆完成后的文件夹运行代码
 新增在ubuntn上一键安装---sudo bash deploy/install-ubuntu-systemd.sh
 安装完成后.修改配置文件---sudo nano /etc/arb-bot.env
 后续基本操作
