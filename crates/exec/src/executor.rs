@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arb_core::{ArbError, ArbResult, Side, Venue};
 use chrono::{DateTime, Utc};
@@ -30,6 +31,17 @@ use crate::types::{
     ClientOrderId, LegFill, NewOrder, OrderState, OrderStatus, PairPosition, PositionStatus,
     RealizedSource, Strategy, TaskRules,
 };
+
+/// 下单后短重试查单：只查、不重发。
+///
+/// 第一次立刻查；之后间隔约 200ms / 500ms / 1s / 1s（合计约 2.7 秒）。
+/// 用来吞掉各所「订单已成交、成交明细/查询结果晚到」的窗口，避免把已成交当成结果不明。
+const ORDER_CONFIRM_DELAYS: &[Duration] = &[
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(1),
+];
 
 /// 建仓时就定下来、之后由监控使用的设置。
 #[derive(Debug, Clone, Default)]
@@ -837,20 +849,37 @@ impl Executor {
     ///
     /// `place` 报错且场所不认识这个 id（[`Broker::order_state`] 返回 `None`）才算明确
     /// 没发出去，记为拒单；券商在无法确定时必须返回错误而不是 `None`。
+    ///
+    /// 下单后对**所有场所**做短重试查单（[`ORDER_CONFIRM_DELAYS`]）：只复查 `order_state`，
+    /// **绝不**再调 `place`。查单报错或暂时 `None` 都继续等；窗口用尽仍 `None` 且 `place`
+    /// 失败 → 拒单；`place` 成功却一直查不到 / 查单持续报错 → 结果不明。
     async fn execute_order(&self, order: &NewOrder) -> ArbResult<OrderState> {
         self.persist_order(&OrderState::new(order.clone())).await?;
         let broker = self.broker(order.venue)?;
         let placed = broker.place(order).await;
-        let mut state = match (broker.order_state(&order.client_order_id).await?, placed) {
-            (Some(state), _) => state,
-            (None, Err(error)) => {
+        let (found, last_lookup_error) = confirm_order_state(broker.as_ref(), order).await;
+        let mut state = match (found, placed, last_lookup_error) {
+            (Some(state), _, _) => state,
+            // 短重试期间查单一直报错：可能已经成交，只是明细/查询未齐 → 结果不明，不能记拒单。
+            (None, _, Some(error)) => {
+                return Err(ArbError::venue(
+                    order.venue.as_str(),
+                    format!(
+                        "订单 {} 短重试查单仍失败（{error}）；停止执行并人工对账，不要重发",
+                        order.client_order_id
+                    ),
+                ));
+            }
+            // 明确查无此 id，且 place 也失败 → 没发到交易所，记拒单。
+            (None, Err(error), None) => {
                 let mut rejected = OrderState::new(order.clone());
                 rejected.status = OrderStatus::Rejected;
                 rejected.reject_reason = Some(error.to_string());
                 self.persist_order(&rejected).await?;
                 return Ok(rejected);
             }
-            (None, Ok(_)) => {
+            // place 成功却始终查不到：结果不明。
+            (None, Ok(_), None) => {
                 return Err(ArbError::venue(
                     order.venue.as_str(),
                     format!(
@@ -872,10 +901,22 @@ impl Executor {
                 ArbError::venue(order.venue.as_str(), "活跃订单缺交易所单号，无法撤单")
             })?;
             broker.cancel(venue_id).await?;
-            state = broker
-                .order_state(&order.client_order_id)
-                .await?
-                .ok_or_else(|| ArbError::venue(order.venue.as_str(), "撤单后订单状态无法核实"))?;
+            let (after_cancel, cancel_lookup_error) =
+                confirm_order_state(broker.as_ref(), order).await;
+            state = match after_cancel {
+                Some(state) => state,
+                None => {
+                    return Err(ArbError::venue(
+                        order.venue.as_str(),
+                        match cancel_lookup_error {
+                            Some(error) => {
+                                format!("撤单后短重试查单仍失败（{error}），无法核实")
+                            }
+                            None => "撤单后订单状态无法核实".into(),
+                        },
+                    ));
+                }
+            };
             if state.order != *order {
                 return Err(ArbError::venue(
                     order.venue.as_str(),
@@ -1075,6 +1116,32 @@ fn realized_note(
     note
 }
 
+
+/// 下单（或撤单）之后短重试查单：只读 [`Broker::order_state`]，绝不重发。
+///
+/// 返回 `(查到的状态, 最后一次查单错误)`。
+/// - 查到 `Some`：立刻返回；
+/// - `Ok(None)` 或临时 `Err`：按 [`ORDER_CONFIRM_DELAYS`] 再查；
+/// - 窗口用尽仍没有 `Some`：带回最后一次错误（若有），由调用方区分拒单 / 结果不明。
+async fn confirm_order_state(
+    broker: &dyn Broker,
+    order: &NewOrder,
+) -> (Option<OrderState>, Option<ArbError>) {
+    let mut last_error = None;
+    let attempts = ORDER_CONFIRM_DELAYS.len() + 1;
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(ORDER_CONFIRM_DELAYS[attempt - 1]).await;
+        }
+        match broker.order_state(&order.client_order_id).await {
+            Ok(Some(state)) => return (Some(state), None),
+            Ok(None) => last_error = None,
+            Err(error) => last_error = Some(error),
+        }
+    }
+    (None, last_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1247,6 +1314,107 @@ mod tests {
         async fn positions(&self) -> ArbResult<Vec<crate::broker::VenuePosition>> {
             Ok(vec![])
         }
+    }
+
+    /// place 当时失败（明细未齐/超时），短重试查单后才看到成交：应记成成交，且 place 只调用一次。
+    #[tokio::test]
+    async fn short_confirm_retries_lookup_without_resubmitting_place() {
+        let path = std::env::temp_dir().join(format!(
+            "arb-confirm-retry-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        let ledger = Arc::new(Ledger::open(&path).await.unwrap());
+
+        struct LateFill {
+            places: std::sync::atomic::AtomicUsize,
+            lookups: std::sync::atomic::AtomicUsize,
+            order: tokio::sync::Mutex<Option<NewOrder>>,
+        }
+
+        #[async_trait]
+        impl Broker for LateFill {
+            fn venue(&self) -> Venue {
+                Venue::LighterRh
+            }
+            fn fee_per_side(&self) -> Decimal {
+                Decimal::ZERO
+            }
+            async fn place(&self, order: &NewOrder) -> ArbResult<crate::types::OrderAck> {
+                self.places
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *self.order.lock().await = Some(order.clone());
+                Err(ArbError::venue(
+                    "lighter-rh",
+                    "fills/trades not yet consistent; refusing invented fee or fill",
+                ))
+            }
+            async fn order_state(&self, id: &ClientOrderId) -> ArbResult<Option<OrderState>> {
+                let n = self
+                    .lookups
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 2 {
+                    return Err(ArbError::venue(
+                        "lighter-rh",
+                        "fills/trades not yet consistent; refusing invented fee or fill",
+                    ));
+                }
+                let order = self
+                    .order
+                    .lock()
+                    .await
+                    .clone()
+                    .expect("place stores the order before failing");
+                assert_eq!(order.client_order_id, *id);
+                let mut state = OrderState::new(order);
+                state.venue_order_id = Some(id.0.clone());
+                state.status = OrderStatus::Filled;
+                state.average_price = Some(dec!(10));
+                state.filled_usdt = dec!(100);
+                Ok(Some(state))
+            }
+            async fn cancel(&self, _venue_id: &str) -> ArbResult<()> {
+                Ok(())
+            }
+            async fn open_orders(&self) -> ArbResult<Vec<OrderState>> {
+                Ok(vec![])
+            }
+            async fn positions(&self) -> ArbResult<Vec<crate::broker::VenuePosition>> {
+                Ok(vec![])
+            }
+        }
+
+        let broker = Arc::new(LateFill {
+            places: 0.into(),
+            lookups: 0.into(),
+            order: tokio::sync::Mutex::new(None),
+        });
+        let executor = Executor::new(Arc::clone(&ledger), vec![broker.clone() as Arc<dyn Broker>]);
+        let order = NewOrder {
+            margin_mode: crate::MarginMode::Isolated,
+            client_order_id: ClientOrderId("confirm-retry-buy-0".into()),
+            venue: Venue::LighterRh,
+            symbol: Symbol::perp("BTC", "USDT"),
+            side: Side::Buy,
+            notional_usdt: dec!(100),
+            quantity: Some(dec!(10)),
+            limit_price: Some(dec!(10)),
+            reduce_only: false,
+            leverage: Some(dec!(2)),
+        };
+        let state = executor.execute_order(&order).await.unwrap();
+        assert_eq!(state.status, OrderStatus::Filled);
+        assert_eq!(state.filled_usdt, dec!(100));
+        assert_eq!(
+            broker.places.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "place must not be retried"
+        );
+        assert!(
+            broker.lookups.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "order_state should be retried until consistent"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     /// 2026-09-30 实盘 NEAR 的四笔成交：按实际成交记账应是 −1.2949 USDT，

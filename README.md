@@ -23,9 +23,18 @@
 走的是同一份流程，默认关闭，要令牌（见「看板交易」）。另有 Lighter RH ↔ Arcus 同名合约
 价差的只读监控（见「Lighter RH ↔ Arcus 价差监控」）。
 
-## 快速开始
+
+新增在ubuntn上一键安装---sudo bash deploy/install-ubuntu-systemd.sh
+安装完成后.修改配置文件---sudo nano /etc/arb-bot.env
+后续基本操作
+sudo systemctl status arb-web      # 看状态
+sudo systemctl restart arb-web     # 重启
+sudo systemctl stop arb-web        # 停止
+sudo systemctl start arb-web       # 启动
+sudo journalctl -u arb-web -n 200  # 看最近日志
 
 ```bash
+快速开始
 cargo build --release
 
 # 资金费套利榜（默认）
@@ -952,6 +961,10 @@ cargo test --offline -p arb-exec --lib arcus_broker::tests
 
 ## 部署
 
+- **Ubuntu systemd 一键安装**：把仓库放到机器上后执行 `sudo bash deploy/install-ubuntu-systemd.sh`。
+  会装编译依赖、Rust、Lighter 官方签名库，编译看板与命令行程序，登记 `arb-web` 服务。
+  程序在 `/opt/arb-bot`，数据在 `/var/lib/arb-bot`，密钥在 `/etc/arb-bot.env`（已有文件不覆盖）。
+  之后用 `sudo arbctl status` / `logs` / `restart`。细节见 `deploy/README.md`。
 - **pm2**：`ecosystem.config.js`（`kill_timeout` 已按排空时限推出）。改完执行 `pm2 restart arb-web --update-env`、`pm2 save`。
 - **systemd**：`deploy/arb-web.service`（沙箱：`ProtectSystem=strict`、只写 `/var/lib/arb-bot`、`NoNewPrivileges`、
   `MemoryMax`；`TimeoutStopSec` 必须大于排空时限）。密钥放 `/etc/arb-bot.env`（0600）。

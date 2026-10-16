@@ -2521,7 +2521,8 @@ impl Drop for Registration {
     }
 }
 
-#[cfg(test)]
+// NativeSigner test doubles load the current process as a .so; Windows cannot.
+#[cfg(all(test, unix))]
 mod tests {
 
     #[test]

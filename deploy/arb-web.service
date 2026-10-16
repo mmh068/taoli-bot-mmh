@@ -1,4 +1,7 @@
-# arb-web 的 systemd 单元（不用 pm2 时）。安装：
+# arb-web 的 systemd 单元（不用 pm2 时）。
+# 一键安装（推荐）：
+#   sudo bash deploy/install-ubuntu-systemd.sh
+# 手工安装：
 #   sudo useradd --system --home /opt/arb-bot --shell /usr/sbin/nologin arb
 #   sudo install -d -o arb -g arb -m 0750 /opt/arb-bot /var/lib/arb-bot
 #   sudo install -m 0755 target/release/arb-web /opt/arb-bot/arb-web
